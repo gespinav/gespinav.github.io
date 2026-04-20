@@ -34,6 +34,7 @@
 <!-- General -->
 <meta name="format-detection" content="telephone=no"/>
 <meta name="referrer" content="strict-origin-when-cross-origin"/>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://www.gstatic.com https://www.google.com https://www.recaptcha.net; connect-src 'self' https://*.googleapis.com https://api.themoviedb.org https://firestore.googleapis.com https://identitytoolkit.googleapis.com https://securetoken.googleapis.com https://recaptchaenterprise.googleapis.com; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; font-src 'self'; frame-src https://www.google.com https://recaptcha.google.com;"/>
 <meta name="description" content="The definitive Top 500 Film &amp; Television database..."/>
 
 <!-- reCAPTCHA v3 — required for Firebase App Check token generation -->
@@ -1646,7 +1647,17 @@ function setTmdbKey(k) {
 }
 // Expose globally so the inline UI button can call it
 window.setTmdbKey = function(k) {
-  setTmdbKey(k);
+  const trimmed = (k || '').trim();
+  // TMDB v3 API keys are 32-character hex strings
+  if (trimmed && !/^[a-f0-9]{32}$/i.test(trimmed)) {
+    const input = document.getElementById('tmdbKeyInput');
+    if (input) {
+      input.style.borderColor = '#8B0000';
+      input.placeholder = 'Invalid key — should be 32 hex characters';
+    }
+    return;
+  }
+  setTmdbKey(trimmed);
   // Clear cache and re-render any open modal
   STREAM_CACHE = {};
   try { localStorage.removeItem(STREAM_CACHE_STORAGE); } catch(e){}
@@ -1658,27 +1669,47 @@ window.setTmdbKey = function(k) {
   }
 };
 
-// ── CACHE (in-memory + localStorage, 24h TTL) ──
+// ── CACHE (in-memory + localStorage, 24h TTL, 300-entry max) ──
 const STREAM_CACHE_STORAGE = 'canon_stream_cache_v1';
-const STREAM_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const STREAM_CACHE_TTL_MS  = 24 * 60 * 60 * 1000;
+const STREAM_CACHE_MAX     = 300;
 let STREAM_CACHE = {};
 try {
   const raw = localStorage.getItem(STREAM_CACHE_STORAGE);
-  if (raw) STREAM_CACHE = JSON.parse(raw);
+  if (raw) {
+    const parsed = JSON.parse(raw);
+    const now = Date.now();
+    // Evict expired entries on load so they don't accumulate in storage
+    Object.keys(parsed).forEach(k => {
+      if (now - parsed[k].t <= STREAM_CACHE_TTL_MS) STREAM_CACHE[k] = parsed[k];
+    });
+  }
 } catch(e) { STREAM_CACHE = {}; }
 
 function cacheGet(id) {
   const entry = STREAM_CACHE[id];
   if (!entry) return null;
-  if (Date.now() - entry.t > STREAM_CACHE_TTL_MS) return null;
+  if (Date.now() - entry.t > STREAM_CACHE_TTL_MS) { delete STREAM_CACHE[id]; return null; }
   return entry.v;
 }
 function cacheSet(id, value) {
+  // Evict oldest entry when at capacity
+  const keys = Object.keys(STREAM_CACHE);
+  if (keys.length >= STREAM_CACHE_MAX) {
+    const oldest = keys.reduce((a, b) => (STREAM_CACHE[a].t < STREAM_CACHE[b].t ? a : b));
+    delete STREAM_CACHE[oldest];
+  }
   STREAM_CACHE[id] = { t: Date.now(), v: value };
   try { localStorage.setItem(STREAM_CACHE_STORAGE, JSON.stringify(STREAM_CACHE)); } catch(e) {}
 }
 
 // ── TMDB FETCH ──
+function fetchWithTimeout(url, timeoutMs = 10000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  return fetch(url, { signal: ctrl.signal }).finally(() => clearTimeout(id));
+}
+
 async function fetchStreamingFromTMDB(d) {
   const key = getTmdbKey();
   if (!key) return { status: 'no-key', services: [] };
@@ -1691,7 +1722,7 @@ async function fetchStreamingFromTMDB(d) {
 
   let tmdbId = null;
   try {
-    const sr = await fetch(searchUrl);
+    const sr = await fetchWithTimeout(searchUrl);
     if (!sr.ok) {
       if (sr.status === 401) return { status: 'bad-key', services: [] };
       return { status: 'error', services: [] };
@@ -1700,7 +1731,7 @@ async function fetchStreamingFromTMDB(d) {
     if (!sj.results || !sj.results.length) {
       // Retry without year constraint (some years are off by one in TMDB)
       const retryUrl = `https://api.themoviedb.org/3/search/${searchType}?api_key=${key}&query=${title}`;
-      const rr = await fetch(retryUrl);
+      const rr = await fetchWithTimeout(retryUrl);
       const rj = await rr.json();
       if (rj.results && rj.results.length) {
         // Find closest year match
@@ -1724,7 +1755,7 @@ async function fetchStreamingFromTMDB(d) {
   // 2. Fetch watch providers for US
   const wpUrl = `https://api.themoviedb.org/3/${searchType}/${tmdbId}/watch/providers?api_key=${key}`;
   try {
-    const wr = await fetch(wpUrl);
+    const wr = await fetchWithTimeout(wpUrl);
     if (!wr.ok) return { status: 'error', services: [] };
     const wj = await wr.json();
     const us = (wj.results && wj.results.US) || {};
@@ -1737,11 +1768,15 @@ async function fetchStreamingFromTMDB(d) {
     const hasRentOrBuy = (us.rent && us.rent.length) || (us.buy && us.buy.length);
     if (hasRentOrBuy) svcs.add('rent');
 
+    const fallbackLink = `https://www.themoviedb.org/${searchType}/${tmdbId}/watch?locale=US`;
+    const rawLink = us.link;
+    const safeTmdbLink = (rawLink && typeof rawLink === 'string' && /^https:\/\/www\.themoviedb\.org\//.test(rawLink))
+      ? rawLink : fallbackLink;
     const result = {
       status: 'ok',
       services: Array.from(svcs),
       tmdbId: tmdbId,
-      tmdbLink: us.link || `https://www.themoviedb.org/${searchType}/${tmdbId}/watch?locale=US`
+      tmdbLink: safeTmdbLink
     };
     return result;
   } catch(e) {
@@ -6120,7 +6155,11 @@ window.updateAuthUI = function updateAuthUI(){
   const ca = window.CANON_AUTH || {};
   if(ca.user) {
     btn.classList.add('auth-btn-signed');
-    label.innerHTML = `<span class="auth-user-email">${ca.user.email.split('@')[0]}</span>`;
+    label.textContent = '';
+    const emailSpan = document.createElement('span');
+    emailSpan.className = 'auth-user-email';
+    emailSpan.textContent = ca.user.email.split('@')[0];
+    label.appendChild(emailSpan);
     icon.textContent = '✓';
   } else {
     btn.classList.remove('auth-btn-signed');
